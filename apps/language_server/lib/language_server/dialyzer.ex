@@ -64,6 +64,8 @@ defmodule ElixirLS.LanguageServer.Dialyzer do
   end
 
   def analyze(parent \\ self(), build_ref, warn_opts, warning_format) do
+    IO.puts("+++<<< analyze ")
+
     GenServer.cast(
       {:global, {parent, __MODULE__}},
       {:analyze, build_ref, warn_opts, warning_format}
@@ -156,6 +158,8 @@ defmodule ElixirLS.LanguageServer.Dialyzer do
 
   @impl GenServer
   def handle_cast({:analyze, build_ref, warn_opts, warning_format}, state) do
+    IO.puts("    handle_cast({:analyze, build_ref, warn_opts, warning_format}, state)")
+
     state =
       ElixirLS.LanguageServer.Build.with_build_lock(fn ->
         if Mix.Project.get() do

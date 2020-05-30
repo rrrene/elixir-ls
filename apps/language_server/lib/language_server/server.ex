@@ -16,7 +16,7 @@ defmodule ElixirLS.LanguageServer.Server do
   """
 
   use GenServer
-  alias ElixirLS.LanguageServer.{SourceFile, Build, Protocol, JsonRpc, Dialyzer}
+  alias ElixirLS.LanguageServer.{SourceFile, Build, Protocol, JsonRpc, Dialyzer, Credo}
 
   alias ElixirLS.LanguageServer.Providers.{
     Completion,
@@ -36,12 +36,14 @@ defmodule ElixirLS.LanguageServer.Server do
 
   defstruct [
     :build_ref,
+    :credo_sup,
     :dialyzer_sup,
     :client_capabilities,
     :root_uri,
     :project_dir,
     :settings,
     build_diagnostics: [],
+    credo_diagnostics: [],
     dialyzer_diagnostics: [],
     needs_build?: false,
     load_all_modules?: false,
@@ -70,6 +72,10 @@ defmodule ElixirLS.LanguageServer.Server do
 
   def dialyzer_finished(server \\ __MODULE__, diagnostics, build_ref) do
     GenServer.cast(server, {:dialyzer_finished, diagnostics, build_ref})
+  end
+
+  def credo_finished(server \\ __MODULE__, status, diagnostics, build_ref) do
+    GenServer.cast(server, {:credo_finished, status, diagnostics, build_ref})
   end
 
   def rebuild(server \\ __MODULE__) do
@@ -118,6 +124,11 @@ defmodule ElixirLS.LanguageServer.Server do
   @impl GenServer
   def handle_cast({:dialyzer_finished, diagnostics, build_ref}, state) do
     {:noreply, handle_dialyzer_result(diagnostics, build_ref, state)}
+  end
+
+  @impl GenServer
+  def handle_cast({:credo_finished, status, diagnostics, build_ref}, state) do
+    {:noreply, handle_credo_result(status, diagnostics, build_ref, state)}
   end
 
   @impl GenServer
@@ -259,7 +270,7 @@ defmodule ElixirLS.LanguageServer.Server do
 
     Build.publish_file_diagnostics(
       uri,
-      state.build_diagnostics ++ state.dialyzer_diagnostics,
+      state.build_diagnostics ++ state.credo_diagnostics ++ state.dialyzer_diagnostics,
       source_file
     )
 
@@ -596,6 +607,8 @@ defmodule ElixirLS.LanguageServer.Server do
   end
 
   defp dialyze(state) do
+    IO.puts("+++ dialyze(state)")
+
     warn_opts =
       (state.settings["dialyzerWarnOpts"] || [])
       |> Enum.map(&String.to_atom/1)
@@ -606,12 +619,27 @@ defmodule ElixirLS.LanguageServer.Server do
     state
   end
 
+  defp credo(state) do
+    IO.puts("+++ credo(state)")
+
+    warn_opts =
+      (state.settings["credoWarnOpts"] || [])
+      |> Enum.map(&String.to_atom/1)
+
+    if credo_enabled?(state),
+      do: Credo.analyze(state.build_ref, warn_opts)
+
+    state
+  end
+
   defp dialyzer_default_format(state) do
     state.settings["dialyzerFormat"] || "dialyxir_long"
   end
 
   defp handle_build_result(status, diagnostics, state) do
-    old_diagnostics = state.build_diagnostics ++ state.dialyzer_diagnostics
+    old_diagnostics =
+      state.build_diagnostics ++ state.credo_diagnostics ++ state.dialyzer_diagnostics
+
     state = put_in(state.build_diagnostics, diagnostics)
 
     state =
@@ -619,15 +647,44 @@ defmodule ElixirLS.LanguageServer.Server do
         state.needs_build? ->
           state
 
-        status == :error or not dialyzer_enabled?(state) ->
-          put_in(state.dialyzer_diagnostics, [])
+        status == :error or not credo_enabled?(state) ->
+          put_in(state.credo_diagnostics, [])
+
+        true ->
+          credo(state)
+      end
+
+    publish_diagnostics(
+      state.build_diagnostics ++ state.credo_diagnostics ++ state.dialyzer_diagnostics,
+      old_diagnostics,
+      state.source_files
+    )
+
+    state
+  end
+
+  defp handle_credo_result(status, diagnostics, _build_ref, state) do
+    IO.puts("+++>>> handle_credo_result")
+
+    old_diagnostics =
+      state.build_diagnostics ++ state.credo_diagnostics ++ state.dialyzer_diagnostics
+
+    state = put_in(state.credo_diagnostics, diagnostics)
+
+    state =
+      cond do
+        state.needs_build? ->
+          state
+
+        status == :error or not credo_enabled?(state) ->
+          put_in(state.credo_diagnostics, [])
 
         true ->
           dialyze(state)
       end
 
     publish_diagnostics(
-      state.build_diagnostics ++ state.dialyzer_diagnostics,
+      state.build_diagnostics ++ state.credo_diagnostics ++ state.dialyzer_diagnostics,
       old_diagnostics,
       state.source_files
     )
@@ -636,11 +693,15 @@ defmodule ElixirLS.LanguageServer.Server do
   end
 
   defp handle_dialyzer_result(diagnostics, build_ref, state) do
-    old_diagnostics = state.build_diagnostics ++ state.dialyzer_diagnostics
+    IO.puts("+++>>> handle_dialyzer_result")
+
+    old_diagnostics =
+      state.build_diagnostics ++ state.credo_diagnostics ++ state.dialyzer_diagnostics
+
     state = put_in(state.dialyzer_diagnostics, diagnostics)
 
     publish_diagnostics(
-      state.build_diagnostics ++ state.dialyzer_diagnostics,
+      state.build_diagnostics ++ state.credo_diagnostics ++ state.dialyzer_diagnostics,
       old_diagnostics,
       state.source_files
     )
@@ -682,6 +743,10 @@ defmodule ElixirLS.LanguageServer.Server do
 
   defp build_enabled?(state) do
     is_binary(state.project_dir)
+  end
+
+  defp credo_enabled?(state) do
+    build_enabled?(state) and state.credo_sup != nil
   end
 
   defp dialyzer_enabled?(state) do
@@ -726,6 +791,8 @@ defmodule ElixirLS.LanguageServer.Server do
     enable_dialyzer =
       Dialyzer.check_support() == :ok && Map.get(settings, "dialyzerEnabled", true)
 
+    enable_credo = Map.get(settings, "credoEnabled", true)
+
     mix_env = Map.get(settings, "mixEnv", "test")
     project_dir = Map.get(settings, "projectDir")
 
@@ -734,6 +801,7 @@ defmodule ElixirLS.LanguageServer.Server do
       |> set_mix_env(mix_env)
       |> set_project_dir(project_dir)
       |> set_dialyzer_enabled(enable_dialyzer)
+      |> set_credo_enabled(enable_credo)
 
     state = create_gitignore(state)
     trigger_build(%{state | settings: settings})
@@ -748,6 +816,21 @@ defmodule ElixirLS.LanguageServer.Server do
       not enable_dialyzer and state.dialyzer_sup != nil ->
         Process.exit(state.dialyzer_sup, :normal)
         %{state | dialyzer_sup: nil, analysis_ready?: false}
+
+      true ->
+        state
+    end
+  end
+
+  defp set_credo_enabled(state, enable_credo) do
+    cond do
+      enable_credo and state.credo_sup == nil and is_binary(state.project_dir) ->
+        {:ok, pid} = Credo.Supervisor.start_link(state.project_dir)
+        %{state | credo_sup: pid}
+
+      not enable_credo and state.credo_sup != nil ->
+        Process.exit(state.credo_sup, :normal)
+        %{state | credo_sup: nil, analysis_ready?: false}
 
       true ->
         state
